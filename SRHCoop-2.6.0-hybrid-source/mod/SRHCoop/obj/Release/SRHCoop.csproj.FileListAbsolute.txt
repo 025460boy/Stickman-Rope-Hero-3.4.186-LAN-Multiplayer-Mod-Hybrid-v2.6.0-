@@ -1,0 +1,5 @@
+E:\deepseek\work\mod\SRHCoop\obj\Release\SRHCoop.csproj.AssemblyReference.cache
+E:\deepseek\work\mod\SRHCoop\obj\Release\SRHCoop.GeneratedMSBuildEditorConfig.editorconfig
+E:\deepseek\work\mod\SRHCoop\obj\Release\SRHCoop.csproj.CoreCompileInputs.cache
+E:\deepseek\work\mod\SRHCoop\bin\Release\SRHCoop.dll
+E:\deepseek\work\mod\SRHCoop\obj\Release\SRHCoop.dll

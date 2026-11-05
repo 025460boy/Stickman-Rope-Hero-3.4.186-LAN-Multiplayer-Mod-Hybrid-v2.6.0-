@@ -1,0 +1,1011 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Net;
+using Game.Character.CharacterController;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+namespace SRHCoop
+{
+    /// <summary>
+    /// LAN co-op with a host-authoritative combat model:
+    ///   * every peer broadcasts its own transform / animation / health (15 Hz)
+    ///   * attack *intents* are sent to the host, who is the only one deciding
+    ///     whether they connect (range, cone, cooldown, damage clamp)
+    ///   * the host broadcasts a single DAMAGE verdict, the victim applies it
+    /// This removes the "I hit you but your client disagreed" divergence the old
+    /// peer-to-peer build had. Host role is elected by lowest peer id, so it
+    /// migrates automatically when the host leaves.
+    /// </summary>
+    public class CoopBehaviour : MonoBehaviour
+    {
+        public const string Version = "2.0.0";
+
+        private CoopConfig _cfg;
+        private Player _player;
+        private AnimationController _anim;
+        private HitEntity _hit;
+        private int _playerInstanceId;
+
+        private readonly Dictionary<string, RemoteAvatar> _avatars = new Dictionary<string, RemoteAvatar>();
+        private readonly Dictionary<string, PeerState> _peers = new Dictionary<string, PeerState>();
+        private readonly Dictionary<string, float> _lastAttackBy = new Dictionary<string, float>();
+        private readonly Dictionary<string, int> _appliedDamage = new Dictionary<string, int>();
+        private readonly Dictionary<string, float> _pingSent = new Dictionary<string, float>();
+
+        private LanTransport _net;
+        private string _myId;
+        private string _myName;
+        private bool _lanOn;
+        private float _sendTimer;
+        private float _pingTimer;
+        private int _stateSeq;
+        private int _atkSeq;
+        private int _pingSeq;
+
+        private bool _showPanel = true;
+        private bool _lastDoMelee;
+        private bool _lastShoot;
+        private int _lastMelee;
+        private float _attackCooldown;
+
+        private Texture2D _white;
+        private GUIStyle _label, _small, _title, _button, _center;
+        private float _bootStart;
+        private bool _frameStarted;
+        private bool _privacyHandled;
+        private bool _bootLogged;
+        private int _lastScreenH;
+        private Font _font;
+        private bool _fontTried, _cjk;
+
+        // local-only test bot (never a host candidate)
+        private PeerState _bot;
+        private float _botTime;
+
+        private float _rttMs = -1f;
+
+        private void Awake()
+        {
+            _cfg = CoopConfig.Load();
+            _myId = System.Guid.NewGuid().ToString("N").Substring(0, 8);
+            _myName = "P-" + _myId.Substring(0, 4);
+
+            _white = new Texture2D(1, 1);
+            _white.SetPixel(0, 0, Color.white);
+            _white.Apply();
+
+            CoopLog.Info("SRHCoop " + Version + " ready, id=" + _myId + " platform=" + Application.platform);
+            CoopLog.Info("log: " + CoopLog.Path);
+        }
+
+        private void OnDestroy()
+        {
+            StopLan();
+        }
+
+        /// <summary>Some emulators never deliver the touch to the privacy panel's
+        /// ACCEPT button (reproducible on the unmodified APK too). Store the same
+        /// keys the button would and continue to the menu.</summary>
+        private System.Collections.IEnumerator SkipPrivacyGate()
+        {
+            yield return new WaitForSeconds(Mathf.Max(0.6f, _cfg.BootSplashSeconds));
+            string scene = SceneManager.GetActiveScene().name ?? "";
+            if (!scene.Contains("Privacy")) yield break;
+            try
+            {
+                PlayerPrefs.SetInt("PrivacyPolicyAcceptedKey", 1);
+                PlayerPrefs.SetInt("PPConfirmed", 1);
+                PlayerPrefs.Save();
+                CoopLog.Info("privacy gate skipped -> Menu");
+                SceneManager.LoadScene("Menu");
+            }
+            catch (Exception e)
+            {
+                CoopLog.Error("skip privacy failed: " + e.Message);
+            }
+        }
+
+        // ------------------------------------------------------------- main loop
+
+        private void Update()
+        {
+            HandlePrivacyGate();
+            TrackLocalPlayer();
+
+            if (!_lanOn && _cfg.AutoStart && _player != null) StartLan();
+
+            if (_lanOn && _net != null)
+            {
+                HandleIncoming();
+
+                _sendTimer -= Time.deltaTime;
+                if (_sendTimer <= 0f)
+                {
+                    _sendTimer = 1f / Mathf.Max(5, _cfg.SendRateHz);
+                    SendLocalState();
+                }
+
+                _pingTimer -= Time.deltaTime;
+                if (_pingTimer <= 0f)
+                {
+                    _pingTimer = 1f;
+                    SendPing();
+                }
+
+                ExpirePeers();
+            }
+
+            DetectLocalAttack();
+        }
+
+        private void TrackLocalPlayer()
+        {
+            Player found = null;
+            try
+            {
+                var pm = PlayerManager.Instance;
+                if (pm != null) found = pm.Player;
+            }
+            catch { }
+            if (found == null)
+            {
+                try { found = UnityEngine.Object.FindObjectOfType<Player>(); }
+                catch { }
+            }
+
+            if (found == null)
+            {
+                if (_player != null && _player.gameObject == null) ClearLocal();
+                return;
+            }
+
+            int id = found.gameObject.GetInstanceID();
+            if (_player == null || id != _playerInstanceId)
+            {
+                ClearAvatars();
+                _player = found;
+                _playerInstanceId = id;
+                _anim = found.GetComponent<AnimationController>();
+                _hit = found;
+                CoopLog.Info("local player bound: " + found.name + " hp=" + found.Health.Current +
+                             " scene=" + SceneManager.GetActiveScene().name);
+            }
+        }
+
+        private void ClearLocal()
+        {
+            _player = null;
+            _anim = null;
+            _hit = null;
+            _playerInstanceId = 0;
+        }
+
+        private void ClearAvatars()
+        {
+            foreach (var a in _avatars.Values) if (a != null) Destroy(a.gameObject);
+            _avatars.Clear();
+        }
+
+        // --------------------------------------------------------------- network
+
+        public void StartLan()
+        {
+            if (_lanOn) return;
+            _net = new LanTransport();
+            _net.Start(_cfg.Port);
+            _lanOn = _net.Running;
+            if (_lanOn) CoopLog.Info("LAN started on port " + _cfg.Port);
+        }
+
+        public void StopLan()
+        {
+            if (_net != null)
+            {
+                try { _net.Broadcast(Wire.BuildSimple(MsgType.Bye, _myId, 0, 0)); } catch { }
+                _net.Stop();
+                _net = null;
+            }
+            _lanOn = false;
+            _peers.Clear();
+            ClearAvatars();
+        }
+
+        /// <summary>Host = peer with the lexicographically smallest id (self included).</summary>
+        public bool IsHost
+        {
+            get
+            {
+                foreach (var kv in _peers)
+                    if (string.CompareOrdinal(kv.Key, _myId) < 0) return false;
+                return true;
+            }
+        }
+
+        private PeerState HostPeer
+        {
+            get
+            {
+                PeerState best = null;
+                foreach (var kv in _peers)
+                    if (string.CompareOrdinal(kv.Key, _myId) < 0)
+                        if (best == null || string.CompareOrdinal(kv.Key, best.Id) < 0) best = kv.Value;
+                return best;
+            }
+        }
+
+        private void SendLocalState()
+        {
+            if (_player == null || _net == null) return;
+            try
+            {
+                int hash = 0;
+                float nt = 0f;
+                if (_anim != null && _anim.MainAnimator != null)
+                {
+                    var st = _anim.MainAnimator.GetCurrentAnimatorStateInfo(0);
+                    hash = st.fullPathHash;
+                    nt = st.normalizedTime;
+                }
+
+                PeerFlags flags = PeerFlags.None;
+                if (_hit != null && _hit.IsDead) flags |= PeerFlags.Dead;
+                if (_player.IsSprinting) flags |= PeerFlags.Sprinting;
+                if (_player.IsFlying) flags |= PeerFlags.Flying;
+                if (IsHost) flags |= PeerFlags.Host;
+
+                _net.Broadcast(Wire.BuildState(_myId, _myName, ++_stateSeq,
+                    _player.transform.position,
+                    _player.transform.eulerAngles.y,
+                    0f,
+                    _hit != null ? _hit.Health.Current : 100f,
+                    _hit != null ? _hit.Health.Max : 100f,
+                    hash, nt, flags));
+            }
+            catch (Exception e) { CoopLog.Error("SendLocalState: " + e.Message); }
+        }
+
+        private void SendPing()
+        {
+            if (_net == null) return;
+            _net.Broadcast(Wire.BuildSimple(MsgType.Ping, _myId, ++_pingSeq,
+                (long)(Time.realtimeSinceStartup * 1000f)));
+        }
+
+        private void HandleIncoming()
+        {
+            List<LanTransport.Datagram> packets = _net.Drain();
+            for (int i = 0; i < packets.Count; i++)
+            {
+                byte[] data = packets[i].Data;
+                IPEndPoint from = packets[i].From;
+                byte type; string id;
+                if (!Wire.ReadHeader(data, out type, out id)) continue;
+                if (id == _myId) continue;
+
+                try
+                {
+                    switch (type)
+                    {
+                        case MsgType.State: OnState(Wire.ReadState(data, from)); break;
+                        case MsgType.Attack: OnAttackIntent(Wire.ReadAttack(data)); break;
+                        case MsgType.Damage: OnDamageVerdict(Wire.ReadDamage(data)); break;
+                        case MsgType.Bye: RemovePeer(id); break;
+                        case MsgType.Ping: OnPing(data, from); break;
+                        case MsgType.Pong: OnPong(data); break;
+                    }
+                }
+                catch (Exception e) { CoopLog.Error("packet " + type + ": " + e.Message); }
+            }
+        }
+
+        private void OnPing(byte[] data, IPEndPoint from)
+        {
+            int seq; long ms;
+            Wire.ReadSimple(data, out seq, out ms);
+            if (_net != null)
+                _net.SendTo(Wire.BuildSimple(MsgType.Pong, _myId, seq, ms), from);
+        }
+
+        private void OnPong(byte[] data)
+        {
+            int seq; long ms;
+            Wire.ReadSimple(data, out seq, out ms);
+            float now = Time.realtimeSinceStartup * 1000f;
+            _rttMs = Mathf.Max(0f, now - ms);
+        }
+
+        private void OnState(PeerState state)
+        {
+            bool isNew = !_peers.ContainsKey(state.Id);
+            state.LastSeen = Time.realtimeSinceStartup;
+            _peers[state.Id] = state;
+
+            RemoteAvatar avatar;
+            if (!_avatars.TryGetValue(state.Id, out avatar) || avatar == null)
+            {
+                if (_player == null) return;
+                avatar = RemoteAvatar.Spawn(_player, state.Id, state.Name, state.Position, state.Yaw);
+                if (avatar == null) return;
+                _avatars[state.Id] = avatar;
+            }
+            avatar.ApplyState(state);
+
+            if (isNew)
+            {
+                CoopLog.Info("peer joined: " + state.Name + " (" + state.Id + ") at " + state.EndPoint);
+                // answer directly so discovery also works when broadcast is one-way
+                if (_player != null) SendLocalStateTo(state.EndPoint);
+            }
+        }
+
+        private void SendLocalStateTo(IPEndPoint target)
+        {
+            if (_player == null || _net == null || target == null) return;
+            try
+            {
+                var st = _anim != null && _anim.MainAnimator != null
+                    ? _anim.MainAnimator.GetCurrentAnimatorStateInfo(0)
+                    : default(AnimatorStateInfo);
+                PeerFlags flags = PeerFlags.None;
+                if (_hit != null && _hit.IsDead) flags |= PeerFlags.Dead;
+                if (IsHost) flags |= PeerFlags.Host;
+                _net.SendTo(Wire.BuildState(_myId, _myName, ++_stateSeq,
+                    _player.transform.position, _player.transform.eulerAngles.y, 0f,
+                    _hit != null ? _hit.Health.Current : 100f,
+                    _hit != null ? _hit.Health.Max : 100f,
+                    st.fullPathHash, st.normalizedTime, flags), target);
+            }
+            catch { }
+        }
+
+        private void ExpirePeers()
+        {
+            List<string> gone = null;
+            foreach (var kv in _peers)
+            {
+                if (Time.realtimeSinceStartup - kv.Value.LastSeen > LanTransport.PeerTimeoutSeconds)
+                {
+                    if (gone == null) gone = new List<string>();
+                    gone.Add(kv.Key);
+                }
+            }
+            if (gone != null) foreach (string id in gone) RemovePeer(id);
+        }
+
+        private void RemovePeer(string id)
+        {
+            if (_peers.Remove(id)) CoopLog.Info("peer left: " + id);
+            RemoteAvatar avatar;
+            if (_avatars.TryGetValue(id, out avatar))
+            {
+                _avatars.Remove(id);
+                if (avatar != null) Destroy(avatar.gameObject);
+            }
+        }
+
+        // ---------------------------------------------------------------- combat
+
+        private void DetectLocalAttack()
+        {
+            if (_player == null || _anim == null || _anim.MainAnimator == null) return;
+            if (!_lanOn || Time.time < _attackCooldown) return;
+
+            bool doMelee = false, shoot = false;
+            int melee = 0;
+            try
+            {
+                doMelee = _anim.MainAnimator.GetBool("DoMelee");
+                shoot = _anim.MainAnimator.GetBool("RangedWeaponShoot");
+                melee = _anim.MainAnimator.GetInteger("Melee");
+            }
+            catch { return; }
+
+            bool meleeStarted = (doMelee && !_lastDoMelee) || (melee != 0 && melee != _lastMelee);
+            bool shootStarted = shoot && !_lastShoot;
+            _lastDoMelee = doMelee;
+            _lastShoot = shoot;
+            _lastMelee = melee;
+            if (!meleeStarted && !shootStarted) return;
+
+            _attackCooldown = Time.time + 0.3f;
+            Vector3 dir = _player.transform.forward;
+            Vector3 origin = _player.transform.position + Vector3.up * 1.2f;
+
+            if (shootStarted) SubmitAttack(1, origin, dir, _cfg.RangedRange, _cfg.RangedDamage);
+            if (meleeStarted) SubmitAttack(0, origin, dir, _cfg.MeleeRange, _cfg.MeleeDamage);
+        }
+
+        private void SubmitAttack(byte kind, Vector3 origin, Vector3 dir, float range, float damage)
+        {
+            var attack = new AttackMsg
+            {
+                AttackerId = _myId,
+                AtkSeq = ++_atkSeq,
+                Kind = kind,
+                Origin = origin,
+                Direction = dir,
+                Range = range,
+                Damage = damage,
+            };
+
+            if (IsHost)
+            {
+                ResolveAttack(attack);
+            }
+            else
+            {
+                PeerState host = HostPeer;
+                if (host != null && _net != null)
+                    _net.SendTo(Wire.BuildAttack(attack), host.EndPoint);
+                else
+                    _net.Broadcast(Wire.BuildAttack(attack));   // host not known yet
+            }
+        }
+
+        private void OnAttackIntent(AttackMsg attack)
+        {
+            if (!IsHost) return;                  // only the host decides
+            if (attack.AttackerId == _myId) return;
+            ResolveAttack(attack);
+        }
+
+        /// <summary>Host side: validate an attack intent and broadcast the verdict.</summary>
+        private void ResolveAttack(AttackMsg attack)
+        {
+            float now = Time.realtimeSinceStartup;
+            float last;
+            if (_lastAttackBy.TryGetValue(attack.AttackerId, out last) && now - last < 0.18f) return;
+            _lastAttackBy[attack.AttackerId] = now;
+
+            float damage = Mathf.Clamp(attack.Damage, 0f, 60f);
+            float range = Mathf.Clamp(attack.Range, 0f, 80f);
+            Vector3 dir = attack.Direction.normalized;
+
+            foreach (var kv in _peers)
+            {
+                PeerState p = kv.Value;
+                if (p.Id == attack.AttackerId) continue;
+                TryResolveHit(attack, p.Id, p.Position, p.Dead, damage, range, dir);
+            }
+
+            // The host is a victim too - without this a client could never damage it.
+            if (_player != null && _hit != null && !_hit.IsDead && attack.AttackerId != _myId)
+                TryResolveHit(attack, _myId, _player.transform.position, false, damage, range, dir);
+        }
+
+        private void TryResolveHit(AttackMsg attack, string victimId, Vector3 victimPos, bool victimDead,
+            float damage, float range, Vector3 dir)
+        {
+            if (victimDead) return;
+
+            Vector3 target = victimPos + Vector3.up * 1.0f;
+            Vector3 toTarget = target - attack.Origin;
+            float dist = toTarget.magnitude;
+            if (dist > range) return;
+
+            float angle = Vector3.Angle(dir, toTarget);
+            float limit = attack.Kind == 0 ? 70f : 25f;
+            if (dist > 1.2f && angle > limit) return;
+
+            var verdict = new DamageMsg
+            {
+                AttackerId = attack.AttackerId,
+                VictimId = victimId,
+                AtkSeq = attack.AtkSeq,
+                Amount = damage,
+                Kind = attack.Kind,
+                Origin = attack.Origin,
+                Direction = dir,
+            };
+            _net.Broadcast(Wire.BuildDamage(verdict));
+            ApplyDamageLocally(verdict);
+        }
+
+        private void OnDamageVerdict(DamageMsg dmg)
+        {
+            // Clients trust the host; the host already applied its own verdict.
+            if (!IsHost) ApplyDamageLocally(dmg);
+        }
+
+        private void ApplyDamageLocally(DamageMsg dmg)
+        {
+            // optimistic update of the remote health bar; corrected by the next state packet
+            RemoteAvatar avatar;
+            if (_avatars.TryGetValue(dmg.VictimId, out avatar) && avatar != null)
+                avatar.Health = Mathf.Max(0f, avatar.Health - dmg.Amount);
+
+            if (dmg.VictimId != _myId) return;
+            if (_hit == null || _hit.IsDead) return;
+
+            string key = dmg.AttackerId + ":" + dmg.AtkSeq;
+            int seen;
+            if (_appliedDamage.TryGetValue(dmg.AttackerId, out seen) && seen >= dmg.AtkSeq) return;
+            _appliedDamage[dmg.AttackerId] = dmg.AtkSeq;
+
+            try
+            {
+                _hit.OnHit(DamageType.Instant, null, dmg.Amount, dmg.Origin, dmg.Direction);
+                CoopLog.Info("hit by " + dmg.AttackerId + " for " + dmg.Amount +
+                             " (hp " + _hit.Health.Current + ")");
+            }
+            catch (Exception e) { CoopLog.Error("apply damage: " + e.Message); }
+        }
+
+        // ------------------------------------------------------------------- gui
+
+        private static readonly string[] CjkFonts =
+        {
+            "Noto Sans CJK SC", "Noto Sans SC", "Noto Sans CJK", "Source Han Sans CN",
+            "Noto Sans CJK JP", "Droid Sans Fallback", "sans-serif"
+        };
+
+        private void EnsureFont(int size)
+        {
+            if (_font != null || _fontTried) return;
+            _fontTried = true;
+            for (int i = 0; i < CjkFonts.Length && _font == null; i++)
+            {
+                try
+                {
+                    Font f = Font.CreateDynamicFontFromOSFont(CjkFonts[i], size);
+                    if (f == null) continue;
+                    f.RequestCharactersInTexture("鑱旀満鐜╁", size, FontStyle.Normal);
+                    CharacterInfo ci;
+                    if (f.GetCharacterInfo('鑱?, out ci, size, FontStyle.Normal) && ci.glyphWidth > 0)
+                    {
+                        _font = f;
+                        _cjk = true;
+                        CoopLog.Info("CJK font: " + CjkFonts[i]);
+                    }
+                }
+                catch { }
+            }
+            if (_font == null) CoopLog.Warn("no CJK font, English UI");
+        }
+
+        private string L(string cn, string en) { return _cjk ? cn : en; }
+
+        private void EnsureStyles()
+        {
+            if (_label != null && _lastScreenH == Screen.height) return;
+            _lastScreenH = Screen.height;
+            int baseSize = Mathf.Max(20, Mathf.RoundToInt(Screen.height / 34f * _cfg.UiScale));
+            EnsureFont(baseSize);
+            UiKit.Init();
+
+            _label = Label(baseSize, FontStyle.Bold, UiKit.Text);
+            _small = Label(Mathf.Max(17, baseSize - 5), FontStyle.Normal, UiKit.Muted);
+            _title = Label(baseSize + 3, FontStyle.Bold, new Color(1f, 0.93f, 0.72f));
+            _center = Label(baseSize, FontStyle.Bold, UiKit.Text);
+            _center.alignment = TextAnchor.MiddleCenter;
+            _button = _center;
+        }
+
+        private GUIStyle Label(int size, FontStyle style, Color color)
+        {
+            var s = new GUIStyle(GUI.skin.label)
+            {
+                fontSize = size,
+                fontStyle = style,
+                alignment = TextAnchor.MiddleLeft,
+                wordWrap = false,
+            };
+            s.normal.textColor = color;
+            if (_font != null) s.font = _font;
+            return s;
+        }
+
+        /// <summary>The launch scene only shows the Naxeex logo and its ACCEPT button
+        /// cannot be pressed on some emulators, so we set the same prefs it would and
+        /// continue to the menu after the boot screen has been shown.</summary>
+        private void HandlePrivacyGate()
+        {
+            if (_privacyHandled || !_cfg.SkipPrivacyScreen) return;
+            // Wait for the first rendered frame: Unity shows the native splash while
+            // the first scene loads, and skipping before that means the launch screen
+            // (logo + mascot) never gets drawn at all.
+            if (!_frameStarted) return;
+            string scene;
+            try { scene = SceneManager.GetActiveScene().name ?? ""; }
+            catch { return; }
+            if (!scene.Contains("Privacy")) return;
+
+            _privacyHandled = true;
+            CoopLog.Info("privacy scene detected: " + scene);
+            StartCoroutine(SkipPrivacyGate());
+        }
+
+        private void OnGUI()
+        {
+            if (_white == null) return;
+            if (!_frameStarted)
+            {
+                // Start the launch-screen timer from the first rendered frame: on slow
+                // devices the scene can take >10 s to appear after Awake.
+                _frameStarted = true;
+                _bootStart = Time.realtimeSinceStartup;
+            }
+            EnsureStyles();
+            float s = Mathf.Max(0.5f, Screen.height / 1080f);
+            if (_cfg.ShowHealthBars) DrawHealthBars(s);
+            DrawPanel();
+            DrawBootSplash();
+        }
+
+        /// <summary>
+        /// The launch screen is the level0 privacy scene: only the Naxeex logo is
+        /// visible (the panel is faded out), so the mascot is drawn small, centred
+        /// below the logo, on the scene's black background.
+        /// </summary>
+        private void DrawBootSplash()
+        {
+            if (UiKit.Chibi == null) return;
+            float t = Time.realtimeSinceStartup - _bootStart;
+            float hold = Mathf.Max(0.8f, _cfg.BootSplashSeconds);
+            if (t > hold + 0.8f) return;
+            if (SceneManager.GetActiveScene().name == "Game") return;
+
+            float fade = t < 0.4f ? t / 0.4f : (t > hold ? Mathf.Clamp01((hold + 0.8f - t) / 0.8f) : 1f);
+            if (fade <= 0.01f) return;
+
+            if (!_bootLogged)
+            {
+                _bootLogged = true;
+                CoopLog.Info("[BOOT] t=" + t.ToString("F1") + " hold=" + hold.ToString("F1") +
+                             " chibi=" + (UiKit.Chibi != null) + " scene=" + SceneManager.GetActiveScene().name);
+            }
+
+            string scene = "";
+            try { scene = SceneManager.GetActiveScene().name ?? ""; } catch { }
+            // Only the launch scene has the Naxeex logo, so the mascot belongs there.
+            // (Returning players skip that scene, and drawing over the menu looked
+            // like a stray sticker on top of the HUD.)
+            if (!scene.Contains("Privacy")) return;
+
+            float h = Screen.height * 0.135f;
+            float w = h * ((float)UiKit.Chibi.width / UiKit.Chibi.height);
+            float cx = Screen.width * 0.5f;
+            float top = Screen.height * 0.775f;
+
+            // soft dark plate so the mascot keeps its black backdrop everywhere
+            float pp = h * 0.10f;
+            UiKit.DrawRounded(new Rect(cx - w * 0.5f - pp, top - pp, w + pp * 2, h + pp * 2),
+                new Color(0f, 0f, 0f, 0.55f * fade), 18f);
+
+            GUI.color = new Color(1f, 1f, 1f, fade);
+            GUI.DrawTexture(new Rect(cx - w * 0.5f, top, w, h), UiKit.Chibi, ScaleMode.ScaleToFit, true);
+            GUI.color = Color.white;
+
+            GUIStyle s = _small;
+            if (s != null)
+            {
+                string cap = L("灞€鍩熺綉鑱旀満宸插姞杞?, "LAN co-op loaded");
+                Vector2 size = s.CalcSize(new GUIContent(cap));
+                GUI.color = new Color(1f, 1f, 1f, 0.55f * fade);
+                GUI.Label(new Rect(cx - size.x * 0.5f, top + h + h * 0.16f, size.x, size.y), cap, s);
+                GUI.color = Color.white;
+            }
+        }
+
+        private void DrawHealthBars(float s)
+        {
+            Camera cam = null;
+            try { cam = Camera.main; } catch { }
+            if (cam == null) return;
+
+            float u = s * _cfg.UiScale;
+            foreach (var kv in _avatars)
+            {
+                RemoteAvatar avatar = kv.Value;
+                if (avatar == null || !avatar.gameObject.activeInHierarchy) continue;
+
+                Vector3 sp = cam.WorldToScreenPoint(avatar.BarAnchor);
+                if (sp.z <= 0.1f) continue;
+
+                float w = 132f * u, h = 12f * u;
+                float x = sp.x - w * 0.5f;
+                float y = Screen.height - sp.y;
+                float frac = avatar.MaxHealth <= 0f ? 0f : Mathf.Clamp01(avatar.Health / avatar.MaxHealth);
+
+                GUI.color = new Color(0f, 0f, 0f, 0.7f);
+                GUI.DrawTexture(new Rect(x - 2f * u, y - 2f * u, w + 4f * u, h + 4f * u), _white);
+                GUI.color = new Color(0.15f, 0.15f, 0.15f, 0.9f);
+                GUI.DrawTexture(new Rect(x, y, w, h), _white);
+                GUI.color = frac > 0.5f
+                    ? new Color(0.25f, 0.9f, 0.3f, 1f)
+                    : (frac > 0.22f ? new Color(0.95f, 0.75f, 0.15f, 1f) : new Color(0.9f, 0.2f, 0.15f, 1f));
+                GUI.DrawTexture(new Rect(x, y, w * frac, h), _white);
+
+                GUI.color = Color.white;
+                string caption = avatar.DisplayName;
+                if (avatar.IsHost) caption += L("锛堜富鏈猴級", " [HOST]");
+                if (avatar.Dead) caption += L("锛堥樀浜★級", " [DEAD]");
+                Vector2 size = _small.CalcSize(new GUIContent(caption));
+                GUI.Label(new Rect(sp.x - size.x * 0.5f, y - size.y - 3f * u, size.x, size.y),
+                          caption, _small);
+            }
+            GUI.color = Color.white;
+        }
+
+        private void DrawPanel()
+        {
+            // keep the launch screen clean: only logo + mascot
+            string sceneNow = "";
+            try { sceneNow = SceneManager.GetActiveScene().name ?? ""; } catch { }
+            if (sceneNow.Contains("Privacy") && Time.realtimeSinceStartup - _bootStart < Mathf.Max(0.6f, _cfg.BootSplashSeconds))
+                return;
+
+            float fs = _label.fontSize;
+            float pad = fs * 0.62f;
+            float bh = fs * 1.85f;
+            float gap = fs * 0.34f;
+            float w = fs * 16.2f;
+            float x0 = pad;
+            float y;
+
+            if (!_showPanel)
+            {
+                Rect pill = new Rect(pad, pad, fs * 4.2f, bh);
+                if (UiKit.Button(pill, L("鑱旀満", "LAN"), _center, true)) _showPanel = true;
+                return;
+            }
+
+            int shown = Mathf.Min(_peers.Count + (_bot != null ? 1 : 0), 4);
+            float headerH = fs * 2.35f;
+            float cardH = fs * 2.0f;
+            float chipH = fs * 1.45f;
+            float infoH = fs * 1.25f;
+            // keep this in sync with the layout below, otherwise the last row spills out
+            float totalH = 5f + headerH + gap
+                           + chipH + gap * 0.6f
+                           + bh + gap * 0.8f
+                           + infoH + gap * 0.5f
+                           + shown * (cardH + gap * 0.6f)
+                           + gap * 0.4f
+                           + bh + gap + bh
+                           + pad;
+
+            Rect panel = new Rect(x0, pad, w, totalH);
+            // drop shadow
+            UiKit.DrawRounded(new Rect(panel.x + 4f, panel.y + 5f, panel.width, panel.height),
+                new Color(0f, 0f, 0f, 0.35f));
+            UiKit.DrawRoundedOutline(panel, UiKit.Panel, UiKit.PanelEdge, 1.2f);
+
+            // header strip
+            Rect header = new Rect(panel.x + 5f, panel.y + 5f, panel.width - 10f, headerH);
+            UiKit.DrawRounded(header, UiKit.Header, 14f);
+            UiKit.Fill(new Rect(header.x + 14f, header.yMax - 2.5f, header.width - 28f, 2.5f),
+                new Color(UiKit.Accent.r, UiKit.Accent.g, UiKit.Accent.b, 0.8f));
+
+            y = header.y + headerH * 0.5f - fs * 0.62f;
+            GUI.Label(new Rect(header.x + fs * 0.7f, y, header.width - fs * 3.4f, fs * 1.3f),
+                L("鐏煷浜虹怀绱㈣嫳闆?路 鑱旀満", "SRH Co-op"), _title);
+
+            Rect close = new Rect(header.xMax - fs * 1.55f, header.y + (headerH - fs * 1.55f) * 0.5f,
+                fs * 1.55f, fs * 1.55f);
+            if (UiKit.Button(close, "脳", _center, false, 0.85f))
+            {
+                _showPanel = false;
+                return;
+            }
+
+            y = header.yMax + gap;
+
+            // role chip + id
+            string role = !_lanOn ? L("鏈仈鏈?, "offline") : (IsHost ? L("涓绘満", "HOST") : L("瀹㈡埛绔?, "CLIENT"));
+            Color chipColor = !_lanOn ? new Color(0.35f, 0.38f, 0.45f, 1f) : (IsHost ? UiKit.Accent : UiKit.Good);
+            float chipW = fs * 3.6f;
+            Rect chip = new Rect(x0 + pad * 0.7f, y, chipW, chipH);
+            UiKit.DrawRounded(chip, new Color(chipColor.r, chipColor.g, chipColor.b, 0.9f), 8f);
+            GUI.Label(chip, role, _center);
+            GUI.Label(new Rect(chip.xMax + fs * 0.45f, y, w - chipW - fs * 2f, chipH), _myId, _small);
+            y += chipH + gap * 0.6f;
+
+            float innerX = x0 + pad * 0.7f;
+            float innerW = w - pad * 1.4f;
+            float halfW = (innerW - gap) * 0.5f;
+
+            if (UiKit.Button(new Rect(innerX, y, halfW, bh),
+                    _lanOn ? L("鍏抽棴鑱旀満", "Stop LAN") : L("寮€濮嬭仈鏈?, "Start LAN"), _center, true))
+            {
+                if (_lanOn) StopLan(); else StartLan();
+            }
+            if (UiKit.Button(new Rect(innerX + halfW + gap, y, halfW, bh),
+                    _cfg.ShowHealthBars ? L("琛€鏉★細鏄剧ず", "Bars: ON") : L("琛€鏉★細闅愯棌", "Bars: OFF"), _center, false))
+                _cfg.ShowHealthBars = !_cfg.ShowHealthBars;
+            y += bh + gap * 0.8f;
+
+            string info = _lanOn
+                ? L("鍦ㄧ嚎 ", "peers ") + _peers.Count
+                  + (_rttMs >= 0f ? L("銆€寤惰繜 ", "  rtt ") + Mathf.RoundToInt(_rttMs) + "ms" : "")
+                  + (_net != null ? L("銆€鏀?", "  rx ") + _net.PacketsReceived : "")
+                : L("涓庡ソ鍙嬭繛鍚屼竴涓?Wi-Fi 鍗冲彲鑷姩鍙戠幇", "Same Wi-Fi required");
+            GUI.Label(new Rect(innerX, y, innerW, fs * 1.25f), info, _small);
+            y += fs * 1.25f + gap * 0.5f;
+
+            // peer cards
+            foreach (var kv in _peers)
+            {
+                DrawPeerCard(new Rect(innerX, y, innerW, cardH), kv.Value.Name, kv.Value.Health,
+                    kv.Value.MaxHealth, kv.Value.IsHost, kv.Value.Dead, kv.Value.RttMs);
+                y += cardH + gap * 0.6f;
+                if (y > Screen.height - bh * 3f) break;
+            }
+            if (_bot != null && y <= Screen.height - bh * 3f)
+            {
+                DrawPeerCard(new Rect(innerX, y, innerW, cardH), _bot.Name, _bot.Health, _bot.MaxHealth,
+                    false, false, -1);
+                y += cardH + gap * 0.6f;
+            }
+            y += gap * 0.4f;
+
+            if (UiKit.Button(new Rect(innerX, y, halfW, bh), L("娴嬭瘯鏈哄櫒浜?, "Test bot"), _center, false))
+                SpawnTestBot();
+            if (UiKit.Button(new Rect(innerX + halfW + gap, y, halfW, bh), L("娴嬭瘯鍙楀嚮", "Test hit"), _center, false))
+                SimulateRemoteHit();
+            y += bh + gap;
+
+            if (UiKit.Button(new Rect(innerX, y, innerW, bh), L("鍥炵幆鑱旀満娴嬭瘯", "Loopback net test"), _center, false, 0.82f))
+                StartCoroutine(LoopbackTest());
+        }
+
+        private void DrawPeerCard(Rect r, string name, float hp, float maxHp, bool host, bool dead, int rtt)
+        {
+            UiKit.DrawRounded(r, new Color(0.10f, 0.13f, 0.19f, 0.95f), 12f);
+            float fs = _label.fontSize;
+            float pad = fs * 0.42f;
+
+            GUI.Label(new Rect(r.x + pad, r.y + pad * 0.6f, r.width * 0.62f, fs * 1.15f),
+                dead ? name + L("锛堥樀浜★級", " [DEAD]") : name, _label);
+
+            if (host)
+            {
+                float bw = fs * 2.4f;
+                Rect badge = new Rect(r.xMax - pad - bw, r.y + pad * 0.55f, bw, fs * 1.05f);
+                UiKit.DrawRounded(badge, new Color(UiKit.Accent.r, UiKit.Accent.g, UiKit.Accent.b, 0.9f), 6f);
+                GUI.Label(badge, L("涓绘満", "HOST"), _small);
+            }
+
+            float barY = r.yMax - pad - fs * 0.55f;
+            float barW = r.width - pad * 2f - fs * 3.2f;
+            float frac = maxHp <= 0f ? 0f : Mathf.Clamp01(hp / maxHp);
+            Color c = frac > 0.5f ? UiKit.Good
+                : (frac > 0.22f ? new Color(0.95f, 0.75f, 0.15f, 1f) : new Color(0.90f, 0.28f, 0.22f, 1f));
+            UiKit.Bar(new Rect(r.x + pad, barY, barW, fs * 0.55f), frac, c,
+                new Color(0.06f, 0.07f, 0.10f, 1f));
+
+            GUI.Label(new Rect(r.xMax - pad - fs * 3.1f, barY - fs * 0.14f, fs * 3.1f, fs * 0.9f),
+                string.Format("{0:F0}/{1:F0}", hp, maxHp), _small);
+        }
+
+        /// <summary>
+        /// Opens a second UDP endpoint on this device that impersonates a real peer:
+        /// it sends a state packet, then an attack intent. This exercises the whole
+        /// wire path (serialise, socket, host validation, damage verdict, victim
+        /// application) without needing a second phone.
+        /// </summary>
+        private System.Collections.IEnumerator LoopbackTest()
+        {
+            if (_player == null || _net == null)
+            {
+                CoopLog.Warn("[LOOP] no player / LAN off");
+                yield break;
+            }
+            string fakeId = "zzzz" + _myId.Substring(0, 4);
+            int fakePort = _cfg.Port + 1;
+            var t = new LanTransport();
+            t.Start(fakePort);
+            CoopLog.Info("[LOOP] fake peer " + fakeId + " on udp " + fakePort);
+
+            Vector3 pos = _player.transform.position + _player.transform.forward * 2f;
+            t.SendTo(Wire.BuildState(fakeId, L("鍥炵幆鐜╁", "LoopPeer"), 1, pos,
+                    _player.transform.eulerAngles.y + 180f, 0f, 100f, 100f, 0, 0f, PeerFlags.None),
+                new IPEndPoint(IPAddress.Loopback, _cfg.Port));
+
+            yield return new WaitForSeconds(1.2f);
+            CoopLog.Info("[LOOP] peers now=" + _peers.Count + " host=" + IsHost);
+
+            var attack = new AttackMsg
+            {
+                AttackerId = fakeId,
+                AtkSeq = 1,
+                Kind = 0,
+                Origin = _player.transform.position + Vector3.up * 1.2f + _player.transform.forward * 2f,
+                Direction = -_player.transform.forward,
+                Range = 3.2f,
+                Damage = 10f,
+            };
+            CoopLog.Info("[LOOP] sending attack intent, hp=" + _hit.Health.Current);
+            t.SendTo(Wire.BuildAttack(attack), new IPEndPoint(IPAddress.Loopback, _cfg.Port));
+
+            yield return new WaitForSeconds(1.5f);
+            CoopLog.Info("[LOOP] hp after=" + (_hit == null ? -1f : _hit.Health.Current));
+            t.Stop();
+        }
+
+        // ------------------------------------------------------------- debug bot
+
+        public void SpawnTestBot()
+        {
+            if (_player == null)
+            {
+                CoopLog.Warn("no local player to clone yet");
+                return;
+            }
+            const string botId = "bot-1";
+            RemoteAvatar old;
+            if (_avatars.TryGetValue(botId, out old) && old != null) Destroy(old.gameObject);
+            _avatars.Remove(botId);
+
+            string name = L("娴嬭瘯鏈哄櫒浜?, "TestBot");
+            Vector3 pos = _player.transform.position + _player.transform.forward * 2.2f;
+            float yaw = _player.transform.eulerAngles.y + 180f;
+            RemoteAvatar avatar = RemoteAvatar.Spawn(_player, botId, name, pos, yaw);
+            if (avatar == null) return;
+            _avatars[botId] = avatar;
+
+            _bot = new PeerState
+            {
+                Id = botId,
+                Name = name,
+                Position = pos,
+                Yaw = yaw,
+                Health = 100f,
+                MaxHealth = 100f,
+            };
+            avatar.ApplyState(_bot);
+            _botTime = 0f;
+            CoopLog.Info("test bot spawned");
+        }
+
+        public void SimulateRemoteHit()
+        {
+            if (_player == null || _hit == null)
+            {
+                CoopLog.Warn("no local player for hit test");
+                return;
+            }
+            // Goes through the real authority path: host resolves, victim applies.
+            var attack = new AttackMsg
+            {
+                AttackerId = "bot-1",
+                AtkSeq = ++_atkSeq,
+                Kind = 0,
+                Origin = _player.transform.position + Vector3.up * 1.2f + _player.transform.forward * 2.2f,
+                Direction = -_player.transform.forward,
+                Range = 3.2f,
+                Damage = 15f,
+            };
+            CoopLog.Info("[TEST] remote hit, hp before=" + _hit.Health.Current +
+                         " host=" + IsHost);
+            if (IsHost) ResolveAttack(attack);
+            else
+            {
+                PeerState host = HostPeer;
+                if (host != null && _net != null) _net.SendTo(Wire.BuildAttack(attack), host.EndPoint);
+            }
+            CoopLog.Info("[TEST] hp after=" + (_hit == null ? -1f : _hit.Health.Current));
+        }
+
+        private void LateUpdate()
+        {
+            if (_bot == null || _player == null) return;
+            RemoteAvatar avatar;
+            if (!_avatars.TryGetValue(_bot.Id, out avatar) || avatar == null) return;
+
+            _botTime += Time.deltaTime;
+            _bot.Position = _player.transform.position + _player.transform.forward * 2.2f;
+            _bot.Yaw = _player.transform.eulerAngles.y + 180f;
+            _bot.Health = 60f + Mathf.Sin(_botTime * 2f) * 40f;
+            if (_anim != null && _anim.MainAnimator != null)
+            {
+                var st = _anim.MainAnimator.GetCurrentAnimatorStateInfo(0);
+                _bot.AnimHash = st.fullPathHash;
+                _bot.AnimTime = st.normalizedTime;
+            }
+            avatar.ApplyState(_bot);
+        }
+    }
+}
+

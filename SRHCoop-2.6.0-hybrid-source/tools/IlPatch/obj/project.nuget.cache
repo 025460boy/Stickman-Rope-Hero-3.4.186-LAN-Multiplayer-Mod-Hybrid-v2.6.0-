@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "ig2XZrCVPFs=",
+  "success": true,
+  "projectFilePath": "E:\\deepseek\\work\\tools\\IlPatch\\IlPatch.csproj",
+  "expectedPackageFiles": [
+    "D:\\Users\\Administrator\\.nuget\\packages\\mono.cecil\\0.11.5\\mono.cecil.0.11.5.nupkg.sha512"
+  ],
+  "logs": []
+}

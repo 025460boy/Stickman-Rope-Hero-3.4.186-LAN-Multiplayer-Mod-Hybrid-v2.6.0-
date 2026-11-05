@@ -1,0 +1,63 @@
+{
+  "format": 1,
+  "restore": {
+    "E:\\deepseek\\work\\mod\\SRHCoop\\SRHCoop.csproj": {}
+  },
+  "projects": {
+    "E:\\deepseek\\work\\mod\\SRHCoop\\SRHCoop.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "E:\\deepseek\\work\\mod\\SRHCoop\\SRHCoop.csproj",
+        "projectName": "SRHCoop",
+        "projectPath": "E:\\deepseek\\work\\mod\\SRHCoop\\SRHCoop.csproj",
+        "packagesPath": "D:\\Users\\Administrator\\.nuget\\packages\\",
+        "outputPath": "E:\\deepseek\\work\\mod\\SRHCoop\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "D:\\Users\\Administrator\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net35"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net35": {
+            "targetAlias": "net35",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "net35": {
+          "targetAlias": "net35",
+          "dependencies": {
+            "Microsoft.NETFramework.ReferenceAssemblies": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.0.3, )",
+              "autoReferenced": true
+            },
+            "Microsoft.NETFramework.ReferenceAssemblies.net35": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.0.3, )"
+            }
+          },
+          "runtimeIdentifierGraphPath": "E:\\deepseek\\work\\dotnet\\sdk\\8.0.427\\RuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "C7sMkCNdpJ4=",
+  "success": true,
+  "projectFilePath": "E:\\deepseek\\work\\mod\\SRHCoop\\SRHCoop.csproj",
+  "expectedPackageFiles": [
+    "D:\\Users\\Administrator\\.nuget\\packages\\microsoft.netframework.referenceassemblies\\1.0.3\\microsoft.netframework.referenceassemblies.1.0.3.nupkg.sha512",
+    "D:\\Users\\Administrator\\.nuget\\packages\\microsoft.netframework.referenceassemblies.net35\\1.0.3\\microsoft.netframework.referenceassemblies.net35.1.0.3.nupkg.sha512"
+  ],
+  "logs": []
+}
